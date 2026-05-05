@@ -182,7 +182,7 @@ def check_one_product(row: dict) -> dict:
 
     try:
         html = fetch_html(url)
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
         text = clean_text(soup.get_text(" "))
 
         title = ""
