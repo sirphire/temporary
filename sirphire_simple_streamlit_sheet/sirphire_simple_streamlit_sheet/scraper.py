@@ -22,8 +22,17 @@ def normalize_url(base_url: str, href: str) -> str:
 
 
 def is_product_url(url: str) -> bool:
-    low = url.lower()
-    return any(pattern in low for pattern in PRODUCT_URL_PATTERNS)
+    low = url.lower().split("?")[0].split("#")[0].rstrip("/")
+
+    # Category/listing pages ko exclude karo
+    if low.endswith("-back-covers"):
+        return False
+
+    # Product page normally singular hota hai: ...-iphone-16-back-cover
+    if low.endswith("-back-cover"):
+        return True
+
+    return False
 
 
 def fetch_html(url: str, timeout: int = 25) -> str:
