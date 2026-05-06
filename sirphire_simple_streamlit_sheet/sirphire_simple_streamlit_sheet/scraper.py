@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from config import PRODUCT_URL_PATTERNS, TARGET_TEXT, USER_AGENT
+from config import TARGET_TEXT, USER_AGENT
 
 
 def clean_text(value: str) -> str:
@@ -21,61 +21,25 @@ def normalize_url(base_url: str, href: str) -> str:
     return urljoin(base_url, href).split("?")[0].split("#")[0].rstrip("/")
 
 
-def is_product_url(url: str) -> bool:
-    low = url.lower().split("?")[0].split("#")[0].rstrip("/")
-
-    # Category/listing pages ko exclude karo
-    if low.endswith("-back-covers"):
-        return False
-
-    # Product page normally singular hota hai: ...-iphone-16-back-cover
-    if low.endswith("-back-cover"):
-        return True
-
-    return False
+def get_category_slug(category_url: str) -> str:
+    """
+    Example:
+    https://in.sirphire.com/apple-iphone-16-back-covers
+    -> apple-iphone-16-back-covers
+    """
+    return urlparse(category_url).path.strip("/").lower().rstrip("/")
 
 
-def fetch_html(url: str, timeout: int = 25) -> str:
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-    }
-    response = requests.get(url, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    return response.text
+def get_category_model_keywords(category_url: str) -> list[str]:
+    """
+    Example:
+    apple-iphone-16-back-covers
+    -> ["iphone", "16"]
 
-
-def extract_links_from_html(category_url: str, html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    products = []
-    seen = set()
-
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-
-        url = normalize_url(category_url, href)
-
-        if not is_product_url(url):
-            continue
-
-        if url in seen:
-            continue
-
-        seen.add(url)
-        products.append({
-            "url": url,
-            "title": clean_text(a.get_text(" ")),
-        })
-
-    return products
-
-
-def category_keywords(category_url: str) -> list[str]:
-    path = urlparse(category_url).path.strip("/").lower()
-    tokens = re.split(r"[^a-z0-9]+", path)
+    Ye keywords product URL me hone chahiye.
+    """
+    slug = get_category_slug(category_url)
+    tokens = re.split(r"[^a-z0-9]+", slug)
 
     stop_words = {
         "apple",
@@ -101,75 +65,99 @@ def category_keywords(category_url: str) -> list[str]:
     return keywords
 
 
-def get_sitemap_urls(base_url: str) -> list[str]:
-    root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-    sitemap_url = root + "/sitemap.xml"
+def is_product_url_for_category(url: str, category_url: str) -> bool:
+    """
+    Sirf current category ke product pages allow karega.
 
-    try:
-        xml = fetch_html(sitemap_url, timeout=40)
-    except Exception:
-        return []
+    Allow:
+    https://in.sirphire.com/batman-iphone-16-back-cover
 
-    soup = BeautifulSoup(xml, "html.parser")
-    urls = []
+    Reject:
+    https://in.sirphire.com/apple-iphone-16-back-covers
+    https://in.sirphire.com/nothing-phone-3-back-covers
+    https://in.sirphire.com/google-pixel-8-back-covers
+    """
+    low = url.lower().split("?")[0].split("#")[0].rstrip("/")
 
-    for loc in soup.find_all("loc"):
-        value = clean_text(loc.get_text())
-        if value:
-            urls.append(value)
+    # Listing/category pages reject
+    if low.endswith("-back-covers"):
+        return False
 
-    product_sitemaps = [u for u in urls if "product" in u.lower()]
-    return product_sitemaps or urls
+    # Product page must be singular
+    if not low.endswith("-back-cover"):
+        return False
+
+    # Same domain only
+    category_domain = urlparse(category_url).netloc.lower()
+    product_domain = urlparse(low).netloc.lower()
+    if category_domain and product_domain and category_domain != product_domain:
+        return False
+
+    # Product URL me category model keywords hone chahiye
+    keywords = get_category_model_keywords(category_url)
+    if keywords and not all(keyword in low for keyword in keywords):
+        return False
+
+    return True
 
 
-def collect_products_from_sitemap(category_url: str, max_products: int = 1000) -> list[dict]:
-    keywords = category_keywords(category_url)
-    sitemap_urls = get_sitemap_urls(category_url)
+def fetch_html(url: str, timeout: int = 25) -> str:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-IN,en;q=0.9",
+    }
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.text
 
+
+def extract_links_from_html(category_url: str, html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
     products = []
     seen = set()
 
-    for sitemap_url in sitemap_urls[:100]:
-        if len(products) >= max_products:
-            break
-
-        try:
-            xml = fetch_html(sitemap_url, timeout=60)
-        except Exception:
+    for a in soup.select("a[href]"):
+        href = a.get("href", "").strip()
+        if not href:
             continue
 
-        soup = BeautifulSoup(xml, "html.parser")
+        url = normalize_url(category_url, href)
 
-        for loc in soup.find_all("loc"):
-            url = clean_text(loc.get_text()).split("?")[0].split("#")[0].rstrip("/")
-            low = url.lower()
+        if not is_product_url_for_category(url, category_url):
+            continue
 
-            if not is_product_url(url):
-                continue
+        if url in seen:
+            continue
 
-            if keywords and not all(k in low for k in keywords):
-                continue
+        seen.add(url)
 
-            if url in seen:
-                continue
+        title = clean_text(a.get_text(" "))
+        if not title:
+            img = a.find("img")
+            if img:
+                title = clean_text(img.get("alt", ""))
 
-            seen.add(url)
-            products.append({
-                "url": url,
-                "title": "",
-            })
-
-            if len(products) >= max_products:
-                break
+        products.append({
+            "url": url,
+            "title": title,
+        })
 
     return products
+
+
+def collect_products_from_sitemap(category_url: str, max_products: int = 1000) -> list[dict]:
+    """
+    Abhi disabled rakha hai, kyunki sitemap se doosri categories aa rahi thi.
+    Sirf category HTML se products collect honge.
+    """
+    return []
 
 
 def collect_category_products(category_url: str, max_products: int = 1000, max_rounds: int = 120) -> list[dict]:
     """
     Browser/Playwright use nahi hota.
-    1. Category HTML se visible product URLs.
-    2. Sitemap se matching product URLs.
+    Sirf current category page ke HTML se matching product URLs nikalega.
     """
     products = []
     seen = set()
@@ -177,14 +165,6 @@ def collect_category_products(category_url: str, max_products: int = 1000, max_r
     try:
         html = fetch_html(category_url, timeout=40)
         for product in extract_links_from_html(category_url, html):
-            if product["url"] not in seen:
-                seen.add(product["url"])
-                products.append(product)
-    except Exception:
-        pass
-
-    try:
-        for product in collect_products_from_sitemap(category_url, max_products=max_products):
             if product["url"] not in seen:
                 seen.add(product["url"])
                 products.append(product)
