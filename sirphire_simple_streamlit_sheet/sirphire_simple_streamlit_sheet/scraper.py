@@ -1,9 +1,7 @@
 import re
-import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,133 +26,6 @@ def is_product_url(url: str) -> bool:
     return any(pattern in low for pattern in PRODUCT_URL_PATTERNS)
 
 
-def ensure_playwright_browser():
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            browser.close()
-        return
-    except Exception:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-
-def click_load_more_if_exists(page) -> bool:
-    texts = [
-        "Load More",
-        "Load more",
-        "View More",
-        "View more",
-        "Show More",
-        "Show more",
-        "More Products",
-        "more products",
-    ]
-
-    for text in texts:
-        try:
-            btn = page.get_by_text(text, exact=False).last
-            if btn.is_visible(timeout=700):
-                btn.click(timeout=3000)
-                return True
-        except Exception:
-            pass
-
-    try:
-        locators = page.locator("button, a, div[role='button']").all()
-        for item in locators:
-            try:
-                txt = clean_text(item.inner_text(timeout=300)).lower()
-                if any(x in txt for x in ["load more", "view more", "show more", "more products"]):
-                    if item.is_visible(timeout=300):
-                        item.click(timeout=3000)
-                        return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return False
-
-
-def collect_category_products(category_url: str, max_products: int = 1000, max_rounds: int = 120) -> list[dict]:
-    """
-    Category page me sirf 8 products static hote hain, baaki JS/load-more se.
-    Ye function browser open karke scroll/click karta hai aur product URLs collect karta hai.
-    """
-    ensure_playwright_browser()
-
-    from playwright.sync_api import sync_playwright
-
-    products = []
-    seen = set()
-    stable_rounds = 0
-    previous_count = 0
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 900},
-            locale="en-IN",
-        )
-        page = context.new_page()
-        page.goto(category_url, wait_until="networkidle", timeout=90000)
-
-        for _ in range(max_rounds):
-            hrefs = page.eval_on_selector_all(
-                "a[href]",
-                """els => els.map(a => ({
-                    href: a.href,
-                    text: (a.innerText || a.getAttribute('aria-label') || '').trim()
-                }))"""
-            )
-
-            for item in hrefs:
-                url = normalize_url(category_url, item.get("href", ""))
-                if not is_product_url(url):
-                    continue
-                if url in seen:
-                    continue
-
-                seen.add(url)
-                products.append({
-                    "url": url,
-                    "title": clean_text(item.get("text", "")),
-                })
-
-            if len(products) >= max_products:
-                break
-
-            clicked = click_load_more_if_exists(page)
-
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(900)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1200)
-
-            if len(products) == previous_count and not clicked:
-                stable_rounds += 1
-            else:
-                stable_rounds = 0
-
-            previous_count = len(products)
-
-            # Enough stable checks; assume category completed
-            if stable_rounds >= 7:
-                break
-
-        context.close()
-        browser.close()
-
-    return products[:max_products]
-
-
 def fetch_html(url: str, timeout: int = 25) -> str:
     headers = {
         "User-Agent": USER_AGENT,
@@ -164,6 +35,157 @@ def fetch_html(url: str, timeout: int = 25) -> str:
     response = requests.get(url, headers=headers, timeout=timeout)
     response.raise_for_status()
     return response.text
+
+
+def extract_links_from_html(category_url: str, html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    products = []
+    seen = set()
+
+    for a in soup.select("a[href]"):
+        href = a.get("href", "").strip()
+        if not href:
+            continue
+
+        url = normalize_url(category_url, href)
+
+        if not is_product_url(url):
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(url)
+        products.append({
+            "url": url,
+            "title": clean_text(a.get_text(" ")),
+        })
+
+    return products
+
+
+def category_keywords(category_url: str) -> list[str]:
+    path = urlparse(category_url).path.strip("/").lower()
+    tokens = re.split(r"[^a-z0-9]+", path)
+
+    stop_words = {
+        "apple",
+        "mobile",
+        "phone",
+        "case",
+        "cases",
+        "cover",
+        "covers",
+        "back",
+        "backcover",
+        "backcovers",
+        "collection",
+        "collections",
+    }
+
+    keywords = []
+    for token in tokens:
+        if not token or token in stop_words:
+            continue
+        keywords.append(token)
+
+    return keywords
+
+
+def get_sitemap_urls(base_url: str) -> list[str]:
+    root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    sitemap_url = root + "/sitemap.xml"
+
+    try:
+        xml = fetch_html(sitemap_url, timeout=40)
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(xml, "html.parser")
+    urls = []
+
+    for loc in soup.find_all("loc"):
+        value = clean_text(loc.get_text())
+        if value:
+            urls.append(value)
+
+    product_sitemaps = [u for u in urls if "product" in u.lower()]
+    return product_sitemaps or urls
+
+
+def collect_products_from_sitemap(category_url: str, max_products: int = 1000) -> list[dict]:
+    keywords = category_keywords(category_url)
+    sitemap_urls = get_sitemap_urls(category_url)
+
+    products = []
+    seen = set()
+
+    for sitemap_url in sitemap_urls[:100]:
+        if len(products) >= max_products:
+            break
+
+        try:
+            xml = fetch_html(sitemap_url, timeout=60)
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(xml, "html.parser")
+
+        for loc in soup.find_all("loc"):
+            url = clean_text(loc.get_text()).split("?")[0].split("#")[0].rstrip("/")
+            low = url.lower()
+
+            if not is_product_url(url):
+                continue
+
+            if keywords and not all(k in low for k in keywords):
+                continue
+
+            if url in seen:
+                continue
+
+            seen.add(url)
+            products.append({
+                "url": url,
+                "title": "",
+            })
+
+            if len(products) >= max_products:
+                break
+
+    return products
+
+
+def collect_category_products(category_url: str, max_products: int = 1000, max_rounds: int = 120) -> list[dict]:
+    """
+    Browser/Playwright use nahi hota.
+    1. Category HTML se visible product URLs.
+    2. Sitemap se matching product URLs.
+    """
+    products = []
+    seen = set()
+
+    try:
+        html = fetch_html(category_url, timeout=40)
+        for product in extract_links_from_html(category_url, html):
+            if product["url"] not in seen:
+                seen.add(product["url"])
+                products.append(product)
+    except Exception:
+        pass
+
+    try:
+        for product in collect_products_from_sitemap(category_url, max_products=max_products):
+            if product["url"] not in seen:
+                seen.add(product["url"])
+                products.append(product)
+
+            if len(products) >= max_products:
+                break
+    except Exception:
+        pass
+
+    return products[:max_products]
 
 
 def check_one_product(row: dict) -> dict:
