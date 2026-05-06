@@ -1,4 +1,6 @@
 import re
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
@@ -21,28 +23,18 @@ def normalize_url(base_url: str, href: str) -> str:
     return urljoin(base_url, href).split("?")[0].split("#")[0].rstrip("/")
 
 
-def get_category_slug(category_url: str) -> str:
-    """
-    Example:
-    https://in.sirphire.com/apple-iphone-16-back-covers
-    -> apple-iphone-16-back-covers
-    """
-    return urlparse(category_url).path.strip("/").lower().rstrip("/")
-
-
 def get_category_model_keywords(category_url: str) -> list[str]:
     """
     Example:
-    apple-iphone-16-back-covers
-    -> ["iphone", "16"]
+    https://in.sirphire.com/google-pixel-10a-5g-back-covers
+    -> ["google", "pixel", "10a", "5g"]
 
-    Ye keywords product URL me hone chahiye.
+    Product URL me ye keywords hone chahiye, taki sirf same category ke products aaye.
     """
-    slug = get_category_slug(category_url)
-    tokens = re.split(r"[^a-z0-9]+", slug)
+    path = urlparse(category_url).path.strip("/").lower()
+    tokens = re.split(r"[^a-z0-9]+", path)
 
     stop_words = {
-        "apple",
         "mobile",
         "phone",
         "case",
@@ -67,35 +59,28 @@ def get_category_model_keywords(category_url: str) -> list[str]:
 
 def is_product_url_for_category(url: str, category_url: str) -> bool:
     """
-    Sirf current category ke product pages allow karega.
+    Allow product URL:
+    https://in.sirphire.com/some-design-google-pixel-10a-5g-back-cover
 
-    Allow:
-    https://in.sirphire.com/batman-iphone-16-back-cover
-
-    Reject:
-    https://in.sirphire.com/apple-iphone-16-back-covers
-    https://in.sirphire.com/nothing-phone-3-back-covers
-    https://in.sirphire.com/google-pixel-8-back-covers
+    Reject category URL:
+    https://in.sirphire.com/google-pixel-10a-5g-back-covers
     """
-    low = url.lower().split("?")[0].split("#")[0].rstrip("/")
+    clean_url = url.lower().split("?")[0].split("#")[0].rstrip("/")
 
-    # Listing/category pages reject
-    if low.endswith("-back-covers"):
+    if clean_url.endswith("-back-covers"):
         return False
 
-    # Product page must be singular
-    if not low.endswith("-back-cover"):
+    if not clean_url.endswith("-back-cover"):
         return False
 
-    # Same domain only
     category_domain = urlparse(category_url).netloc.lower()
-    product_domain = urlparse(low).netloc.lower()
+    product_domain = urlparse(clean_url).netloc.lower()
+
     if category_domain and product_domain and category_domain != product_domain:
         return False
 
-    # Product URL me category model keywords hone chahiye
     keywords = get_category_model_keywords(category_url)
-    if keywords and not all(keyword in low for keyword in keywords):
+    if keywords and not all(keyword in clean_url for keyword in keywords):
         return False
 
     return True
@@ -112,67 +97,143 @@ def fetch_html(url: str, timeout: int = 25) -> str:
     return response.text
 
 
-def extract_links_from_html(category_url: str, html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    products = []
-    seen = set()
-
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-
-        url = normalize_url(category_url, href)
-
-        if not is_product_url_for_category(url, category_url):
-            continue
-
-        if url in seen:
-            continue
-
-        seen.add(url)
-
-        title = clean_text(a.get_text(" "))
-        if not title:
-            img = a.find("img")
-            if img:
-                title = clean_text(img.get("alt", ""))
-
-        products.append({
-            "url": url,
-            "title": title,
-        })
-
-    return products
-
-
-def collect_products_from_sitemap(category_url: str, max_products: int = 1000) -> list[dict]:
+def ensure_playwright_browser():
     """
-    Abhi disabled rakha hai, kyunki sitemap se doosri categories aa rahi thi.
-    Sirf category HTML se products collect honge.
+    Streamlit Cloud par Chromium missing ho to install try karega.
+    packages.txt root me hona zaroori hai, warna browser dependency error aa sakta hai.
     """
-    return []
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return
+    except Exception:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
-def collect_category_products(category_url: str, max_products: int = 1000, max_rounds: int = 120) -> list[dict]:
-    """
-    Browser/Playwright use nahi hota.
-    Sirf current category page ke HTML se matching product URLs nikalega.
-    """
-    products = []
-    seen = set()
+def click_load_more_if_exists(page) -> bool:
+    texts = [
+        "Load More",
+        "Load more",
+        "View More",
+        "View more",
+        "Show More",
+        "Show more",
+        "More Products",
+        "more products",
+    ]
+
+    for text in texts:
+        try:
+            btn = page.get_by_text(text, exact=False).last
+            if btn.is_visible(timeout=700):
+                btn.click(timeout=3000)
+                return True
+        except Exception:
+            pass
 
     try:
-        html = fetch_html(category_url, timeout=40)
-        for product in extract_links_from_html(category_url, html):
-            if product["url"] not in seen:
-                seen.add(product["url"])
-                products.append(product)
+        locators = page.locator("button, a, div[role='button']").all()
+        for item in locators:
+            try:
+                txt = clean_text(item.inner_text(timeout=300)).lower()
+                if any(x in txt for x in ["load more", "view more", "show more", "more products"]):
+                    if item.is_visible(timeout=300):
+                        item.click(timeout=3000)
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
+def collect_category_products(category_url: str, max_products: int = 1000, max_rounds: int = 150) -> list[dict]:
+    """
+    JS-loaded products collect karega.
+    Browser category page open karega, scroll karega, load-more click karega.
+    Sirf current category ke product URLs save honge.
+    """
+    ensure_playwright_browser()
+
+    from playwright.sync_api import sync_playwright
+
+    products = []
+    seen = set()
+    stable_rounds = 0
+    previous_count = 0
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1366, "height": 900},
+            locale="en-IN",
+        )
+
+        page = context.new_page()
+        page.goto(category_url, wait_until="networkidle", timeout=90000)
+
+        for _ in range(max_rounds):
+            hrefs = page.eval_on_selector_all(
+                "a[href]",
+                """els => els.map(a => ({
+                    href: a.href,
+                    text: (a.innerText || a.getAttribute('aria-label') || '').trim(),
+                    alt: (a.querySelector('img') ? a.querySelector('img').getAttribute('alt') : '') || ''
+                }))"""
+            )
+
+            for item in hrefs:
+                url = normalize_url(category_url, item.get("href", ""))
+
+                if not is_product_url_for_category(url, category_url):
+                    continue
+
+                if url in seen:
+                    continue
+
+                seen.add(url)
+
+                title = clean_text(item.get("text", ""))
+                if not title:
+                    title = clean_text(item.get("alt", ""))
+
+                products.append({
+                    "url": url,
+                    "title": title,
+                })
 
             if len(products) >= max_products:
                 break
-    except Exception:
-        pass
+
+            clicked = click_load_more_if_exists(page)
+
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(1200)
+
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+
+            if len(products) == previous_count and not clicked:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+
+            previous_count = len(products)
+
+            if stable_rounds >= 8:
+                break
+
+        context.close()
+        browser.close()
 
     return products[:max_products]
 
@@ -215,11 +276,15 @@ def check_one_product(row: dict) -> dict:
     return result
 
 
-def check_products_parallel(rows: list[dict], workers: int = 8) -> list[dict]:
+def check_products_parallel(rows: list[dict], workers: int = 1) -> list[dict]:
+    """
+    Option app me rahega, but aap workers = 1 rakho.
+    1 worker = one-by-one safe checking.
+    """
     if not rows:
         return []
 
-    workers = max(1, min(int(workers), 30))
+    workers = max(1, min(int(workers), 5))
     results = []
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
