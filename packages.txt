@@ -18,3 +18,4 @@ libxext6
 libxshmfence1
 libfontconfig1
 fonts-liberation
+libasound2t64
